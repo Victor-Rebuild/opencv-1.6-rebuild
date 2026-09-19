@@ -3340,6 +3340,40 @@ TEST(CovariationMatrixVectorOfMatWithMean, accuracy)
     ASSERT_EQ(sDiff.dot(sDiff), 0.0);
 }
 
+TEST(CovariationMatrixVectorOfMatWithMean, non_contiguous_mean)
+{
+    std::vector<cv::Mat> samples;
+    samples.push_back((cv::Mat_<float>(2, 2) << 1, 2, 3, 4));
+    samples.push_back((cv::Mat_<float>(2, 2) << 2, 4, 6, 8));
+    samples.push_back((cv::Mat_<float>(2, 2) << 3, 6, 9, 12));
+
+    const float sentinel0 = 12345.0f;
+    const float sentinel1 = -12345.0f;
+    cv::Mat meanStorage = (cv::Mat_<float>(2, 3) <<
+        10, 20, sentinel0,
+        30, 40, sentinel1);
+    cv::Mat meanROI = meanStorage(cv::Rect(0, 0, 2, 2));
+    cv::Mat expectedMean = meanROI.clone();
+    cv::Mat continuousMean = expectedMean.clone();
+    ASSERT_TRUE(continuousMean.isContinuous());
+    ASSERT_FALSE(meanROI.isContinuous());
+    ASSERT_EQ(0, cvtest::norm(expectedMean, meanROI, cv::NORM_INF));
+
+    const int flags = cv::COVAR_ROWS | cv::COVAR_USE_AVG;
+    cv::Mat covContinuous, covROI, covPointer;
+    ASSERT_NO_THROW(cv::calcCovarMatrix(samples, covContinuous, continuousMean, flags, CV_32F));
+    ASSERT_NO_THROW(cv::calcCovarMatrix(&samples[0], static_cast<int>(samples.size()),
+                                       covPointer, meanROI, flags, CV_32F));
+    ASSERT_NO_THROW(cv::calcCovarMatrix(samples, covROI, meanROI, flags, CV_32F));
+
+    EXPECT_EQ(0, cvtest::norm(covContinuous, covROI, cv::NORM_INF));
+    EXPECT_EQ(0, cvtest::norm(covPointer, covROI, cv::NORM_INF));
+    EXPECT_EQ(0, cvtest::norm(expectedMean, continuousMean, cv::NORM_INF));
+    EXPECT_EQ(0, cvtest::norm(expectedMean, meanROI, cv::NORM_INF));
+    EXPECT_EQ(sentinel0, meanStorage.at<float>(0, 2));
+    EXPECT_EQ(sentinel1, meanStorage.at<float>(1, 2));
+}
+
 TEST(Core_Pow, special)
 {
     for( int i = 0; i < 100; i++ )
@@ -4487,6 +4521,110 @@ testing::Values(
                       INT_MAX, INT_MAX, INT_MAX,
                       INT_MIN)
 ));
+
+///////////////////////////////////////////////////////////////////////////////////////////
+
+typedef testing::TestWithParam<MatDepth> Core_PatchNaNs;
+
+static float randomNanFlt(RNG& rng)
+{
+    uint32_t r = rng.next();
+    Cv32suf v;
+    v.u = r;
+    // set the exponent and one mantissa bit to get a NaN (and not an infinity)
+    v.u = v.u | 0x7f800001;
+    return v.f;
+}
+
+static double randomNanDbl(RNG& rng)
+{
+    uint32_t r0 = rng.next();
+    uint32_t r1 = rng.next();
+    Cv64suf v;
+    v.u = (uint64_t(r0) << 32) | uint64_t(r1);
+    // set the exponent and one mantissa bit to get a NaN (and not an infinity)
+    v.u = v.u | 0x7ff0000000000001;
+    return v.f;
+}
+
+static void fillReferenceWithNans(cv::RNG& rng, const Size& sz, int type, double val, cv::Mat& in, cv::Mat& gold)
+{
+    in.create(sz, type);
+    gold.create(sz, type);
+
+    for( int i = 0; i < in.rows; i++ )
+    {
+        for( int j = 0; j < in.cols; j++ )
+        {
+            if (CV_MAT_DEPTH(type) == CV_64F)
+            {
+                switch( rng.uniform(0, 4) )
+                {
+                    case 0:
+                        in.at<double>(i, j) = randomNanDbl(rng);
+                        gold.at<double>(i, j) = val;
+                        break;
+                    case 1:
+                        in.at<double>(i, j) = std::numeric_limits<double>::infinity();
+                        gold.at<double>(i, j) =  in.at<double>(i, j);
+                        break;
+                    case 2:
+                        in.at<double>(i, j) = -std::numeric_limits<double>::infinity();
+                        gold.at<double>(i, j) = in.at<double>(i, j);
+                        break;
+
+                    default:
+                        in.at<double>(i, j) = rng.uniform(-100.0, 100.0);
+                        gold.at<double>(i, j) = in.at<double>(i, j);
+                        break;
+                }
+            }
+            if (CV_MAT_DEPTH(type) == CV_32F)
+            {
+                switch( rng.uniform(0, 4) )
+                {
+                    case 0:
+                        in.at<float>(i, j) = randomNanFlt(rng);
+                        gold.at<float>(i, j) = static_cast<float>(val);
+                        break;
+                    case 1:
+                        in.at<float>(i, j) = std::numeric_limits<float>::infinity();
+                        gold.at<float>(i, j) =  in.at<float>(i, j);
+                        break;
+                    case 2:
+                        in.at<float>(i, j) = -std::numeric_limits<float>::infinity();
+                        gold.at<float>(i, j) = in.at<float>(i, j);
+                        break;
+
+                    default:
+                        in.at<float>(i, j) = rng.uniform(-100.0f, 100.0f);
+                        gold.at<float>(i, j) = in.at<float>(i, j);
+                        break;
+                }
+            }
+        }
+    }
+}
+
+TEST_P(Core_PatchNaNs, accuracy)
+{
+    const int depth = GetParam();
+    cv::Mat in, out, gold;
+    fillReferenceWithNans(theRNG(), cv::Size(127, 71), CV_MAKE_TYPE(depth, 1), 142., in, gold);
+    cv::patchNaNs(in, 142.);
+    // bit-exact check independant from
+    cv::Mat in_bin(in.rows, static_cast<int>(in.cols*in.elemSize()), CV_8UC1, in.data);
+    cv::Mat gold_bin(gold.rows, static_cast<int>(gold.cols*gold.elemSize()), CV_8UC1, gold.data);
+    EXPECT_EQ(0, cvtest::norm(gold_bin, in_bin, cv::NORM_INF));
+}
+
+TEST(Core_PatchNaNs_UnsupportedDepth, accuracy)
+{
+    Mat src(3, 3, CV_16F);
+    EXPECT_THROW(patchNaNs(src, 0), cv::Exception);
+}
+
+INSTANTIATE_TEST_CASE_P(/* */, Core_PatchNaNs, testing::Values(CV_32F, CV_64F));
 
 }} // namespace
 /* End of file. */
